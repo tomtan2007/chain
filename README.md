@@ -10,7 +10,7 @@ Opening a window never shrinks the others. You move around by scrolling.
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-000000?style=flat-square&logo=apple&logoColor=white)](#requirements)
 [![Swift](https://img.shields.io/badge/Swift-5%20%7C%206-F05138?style=flat-square&logo=swift&logoColor=white)](main.swift)
 [![Memory](https://img.shields.io/badge/idle%20memory-~5.5%20MB-2ea44f?style=flat-square)](#memory)
-[![Binary](https://img.shields.io/badge/binary-160%20KB-informational?style=flat-square)](#memory)
+[![Binary](https://img.shields.io/badge/binary-180%20KB-informational?style=flat-square)](#memory)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow?style=flat-square)](LICENSE)
 
 [Features](#features) · [Install](#install) · [Shortcuts](#shortcuts) · [Configuration](#configuration) · [How it works](#how-it-works) · [Limitations](#limitations)
@@ -176,7 +176,7 @@ Run `chain reload` to apply changes without restarting.
 |---|---|
 | Idle, with `NSApplication` | 7.7 MB |
 | **Idle, bare run loop (shipped)** | **5.5 MB** |
-| Binary size (`-Osize`, stripped) | 160 KB |
+| Binary size (`-Osize`, stripped) | 180 KB |
 
 Scrolling, measured by sampling a window's on-screen position during a synthetic ⌃⌥ trackpad drag:
 
