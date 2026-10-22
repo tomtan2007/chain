@@ -161,20 +161,30 @@ Run `chain reload` to apply changes without restarting.
 
 - **Model.** Each display has a `Strip` holding an ordered list of `Col`s. Each column has a width fraction and one or more windows with height weights. A column's pixel width is `round(frac × (W − gap) − gap)`.
 - **Reveal.** When focus changes, the strip scrolls just enough to show the focused column plus one gap. It doesn't recentre unless you press ⌃⌥C.
-- **Animation.** An exact-step, critically damped spring (ω = 13) runs on a 60 Hz timer, but only while something is moving. When idle, `chain` uses no CPU.
-- **Gestures.** Scroll deltas move the strip directly, with rubber-banding past the ends. When the gesture ends, the strip projects where its momentum would carry it and snaps to the nearest column edge.
+- **Animation.** The strip scroll uses an exact-step, critically damped spring (ω = 13), and every window has its own position spring (ω = 15). Moving, stacking and opening windows glide instead of jumping. Frames run at the display's refresh rate (120 Hz on ProMotion), only while something is moving. When idle, `chain` uses no CPU.
+- **Input never waits on windows.** The event tap only records where your fingers are. A separate render queue draws the latest position each frame, so trackpad events are never held up by a slow app.
+- **Apps can't stall each other.** Each app's windows are moved on that app's own queue. If an app is still busy with the last frame, it skips ahead to the newest position, and every other window keeps moving.
+- **Gestures.** Scroll deltas move the strip directly, with rubber-banding past the ends. At lift, the velocity comes from the last 100 ms of movement, so pausing before you lift means no fling. The strip then glides to the nearest column edge. Focus switches only after the glide ends, because activating an app briefly stalls its window. The system's own momentum events are swallowed, so they never scroll the app underneath.
 - **Events.** One `CGEventTap` handles both keys and scrolling. `AXObserver`s track window creation, focus, minimising and closing. `NSWorkspace` notifications track app launches, Space changes and wake from sleep.
-- **Fewer window moves.** Each window remembers the frame it was last given, and unchanged windows are skipped. While scrolling, only positions are sent, never sizes.
+- **Fewer window moves.** Each window remembers the frame it was last given. Unchanged windows and windows that stay off-screen are skipped. While scrolling, only positions are sent, never sizes.
 
 ## Memory
 
-`chain` runs as a bare `CFRunLoop` with no `NSApplication`, no SwiftUI and no windows of its own. Frame updates don't allocate memory.
+`chain` runs as a bare `CFRunLoop` with no `NSApplication`, no SwiftUI and no windows of its own.
 
 | Measurement (`footprint`) | Value |
 |---|---|
 | Idle, with `NSApplication` | 7.7 MB |
 | **Idle, bare run loop (shipped)** | **5.5 MB** |
 | Binary size (`-Osize`, stripped) | 160 KB |
+
+Scrolling, measured by sampling a window's on-screen position during a synthetic ⌃⌥ trackpad drag:
+
+| | Before 1.1 | Now |
+|---|---|---|
+| Median time between window moves | 12–14 ms | 8.5 ms (120 Hz) |
+| 95th-percentile time between moves | 45–63 ms | ~20 ms |
+| Stall when lifting the fingers | ~100 ms, with a 150 px jump | none |
 
 ## Limitations
 

@@ -5,8 +5,13 @@
 // Behaviour is modelled on the ChainYourMac web demo (analysed with REA); the
 // code here is an independent implementation.
 //
-// Memory: one process, no SwiftUI, no windows of its own, no per-frame
-// allocation, no NSApplication. AppKit is used only for NSScreen / NSWorkspace.
+// Memory: one process, no SwiftUI, no windows of its own, no NSApplication.
+// AppKit is used only for NSScreen / NSWorkspace.
+//
+// Threads: the main thread owns the model (strips, columns) and handles input.
+// A render queue, ticking at the display's refresh rate, owns everything that
+// talks to windows. They share only the scroll springs and published frame
+// targets, behind `lock`, so slow apps never stall input.
 
 import AppKit
 import ApplicationServices
@@ -96,7 +101,10 @@ func axSetSize(_ el: AXUIElement, _ s: CGSize) {
 final class Win {
     let el: AXUIElement, pid: pid_t, wid: CGWindowID
     var floating = false
-    var placed = CGRect.null          // last frame we applied; skips redundant AX calls
+    // Render-queue state: animated offset within the strip and the last frame sent.
+    var sx = Spring(0), sy = Spring(0)
+    var fresh = true                  // jump straight to the target on the next frame
+    var placed = CGRect.null
     init(el: AXUIElement, pid: pid_t, wid: CGWindowID) { self.el = el; self.pid = pid; self.wid = wid }
 }
 
@@ -113,16 +121,31 @@ var onSpace = Set<CGWindowID>()       // windows on the active Space of each dis
 func live(_ w: Win) -> Bool { onSpace.contains(w.wid) }
 func live(_ c: Col) -> Bool { c.wins.contains(where: live) }
 
+// One frame target: where a window sits within its strip, before scrolling.
+struct Item {
+    let win: Win, col: Col
+    let rel: CGRect                   // x relative to the strip (or the screen edge if fixed), y absolute
+    let fixed: Bool                   // pinned columns don't scroll
+    let raise: Bool                   // selected tab of a tabbed column
+}
+
+let lock = NSLock()
+
 final class Strip {
     let display: CGDirectDisplayID
-    var area = CGRect.zero            // visible frame, AX (top-left) coordinates
-    var full = CGRect.zero            // whole display, AX coordinates
     var cols: [Col] = []
     var fc = 0
-    var scroll = Spring(0)
     var pinL: Col?, pinR: Col?
-    var raw: Double?                  // un-rubber-banded scroll while a gesture drives the strip
     var total = 0.0
+    // Shared with the render queue (guarded by `lock`).
+    var area = CGRect.zero            // visible frame, AX (top-left) coordinates
+    var full = CGRect.zero            // whole display, AX coordinates
+    var scroll = Spring(0)
+    var raw: Double?                  // un-rubber-banded scroll while a gesture drives the strip
+    var items: [Item] = []
+    var origin = 0.0                  // screen x of the strip's left edge
+    var forcePending = false
+    var focusWhenSettled: Win?        // after a fling, focus once the glide ends
 
     init(display: CGDirectDisplayID) { self.display = display }
 
@@ -157,6 +180,8 @@ final class Strip {
     // Minimal scroll that brings the focused column into view.
     func reveal(snap: Bool = false) {
         guard let c = focusedCol, live(c) else { return }
+        lock.lock(); defer { lock.unlock() }
+        if raw != nil { return }          // the user's fingers own the scroll
         var s = scroll.t
         if c.x - g < s { s = c.x - g } else if c.x + c.w + g > s + W { s = c.x + c.w + g - W }
         scroll.t = clamp(s, 0, maxScroll)
@@ -165,61 +190,40 @@ final class Strip {
 
     func centre() {
         guard let c = focusedCol else { return }
+        lock.lock(); defer { lock.unlock() }
         scroll.t = clamp(c.x + c.w / 2 - W / 2, 0, maxScroll)
         if !cfg.animate { scroll.snap() }
     }
 
-    // Push frames to the windows. `force` re-sends even unchanged frames.
+    // Publish frame targets for the render queue. `force` re-sends every frame once.
     func apply(force: Bool = false) {
         let top = area.minY + g, H = area.height - 2 * g
-        for c in cols where live(c) {
-            place(c, x: area.minX + pinLW + c.x - scroll.x, top: top, H: H, force: force)
-        }
-        if let p = pinL { p.w = pinLW - g; place(p, x: area.minX + g, top: top, H: H, force: force) }
-        if let p = pinR { p.w = pinRW - g; place(p, x: area.maxX - pinRW, top: top, H: H, force: force) }
-    }
-
-    private func place(_ c: Col, x: Double, top: Double, H: Double, force: Bool) {
-        let ws = c.wins.filter(live)
-        guard !ws.isEmpty else { return }
-        let tabs = c.tabbed && ws.count > 1
-        let weights = ws.map { w in c.weights[c.wins.firstIndex { $0 === w }!] }
-        let avail = H - Double(ws.count - 1) * g, sum = weights.reduce(0, +)
-        var y = top
-        for (i, w) in ws.enumerated() {
-            let h = tabs ? H : round(avail * weights[i] / sum)
-            var r = CGRect(x: round(x), y: y, width: c.w, height: h)
-            if !tabs { y += h + g }
-            // Off-screen columns must not spill onto a neighbouring display: park them in a corner.
-            if !r.intersects(area), screens.contains(where: { $0.display != display && r.intersects($0.full) }) {
-                r.origin = CGPoint(x: full.maxX - 1, y: full.maxY - 1)
-            }
-            set(w, r, force: force)
-        }
-        if tabs, let sel = c.wins.indices.contains(c.row) ? c.wins[c.row] : nil, live(sel) {
-            AXUIElementPerformAction(sel.el, kAXRaiseAction as CFString)
-        }
-    }
-
-    private func set(_ w: Win, _ r: CGRect, force: Bool) {
-        if !force && w.placed == r { return }
-        if force || w.placed.size != r.size {
-            axSetSize(w.el, r.size); axSetPos(w.el, r.origin); axSetSize(w.el, r.size)
-        } else {
-            axSetPos(w.el, r.origin)
-        }
-        w.placed = r
-    }
-
-    // Columns whose app refused the requested width keep the width it chose.
-    func respectStubborn() -> Bool {
-        var changed = false
-        for c in cols where live(c) {
-            for w in c.wins where live(w) {
-                if let f = axFrame(w.el), f.width > c.w + 2, f.width < area.width { c.minW = f.width; changed = true }
+        var next: [Item] = []
+        func add(_ c: Col, x: Double, fixed: Bool) {
+            let ws = c.wins.filter(live)
+            guard !ws.isEmpty else { return }
+            let tabs = c.tabbed && ws.count > 1
+            let weights = ws.map { w in c.weights[c.wins.firstIndex { $0 === w }!] }
+            let avail = H - Double(ws.count - 1) * g, sum = weights.reduce(0, +)
+            var y = top
+            for (i, w) in ws.enumerated() {
+                let h = tabs ? H : round(avail * weights[i] / sum)
+                next.append(Item(win: w, col: c, rel: CGRect(x: x, y: y, width: c.w, height: h), fixed: fixed,
+                                 raise: tabs && w === c.wins[clamp(c.row, 0, c.wins.count - 1)]))
+                if !tabs { y += h + g }
             }
         }
-        return changed
+        for c in cols where live(c) { add(c, x: c.x, fixed: false) }
+        if let p = pinL { p.w = pinLW - g; add(p, x: g, fixed: true) }
+        if let p = pinR { p.w = pinRW - g; add(p, x: area.width - pinRW, fixed: true) }
+
+        lock.lock()
+        for it in next where !items.contains(where: { $0.win === it.win }) { it.win.fresh = true }
+        items = next
+        origin = area.minX + pinLW
+        if force { forcePending = true }
+        lock.unlock()
+        renderer.request()
     }
 
     func detach(_ w: Win) {
@@ -243,6 +247,7 @@ final class Strip {
 
     // Snap to the column nearest to where the gesture's momentum would land.
     func settle(velocity v: Double) {
+        lock.lock()
         let proj = scroll.x + v * 0.22, m = maxScroll
         var best = 0.0, bd = Double.infinity
         for c in cols where live(c) {
@@ -253,10 +258,13 @@ final class Strip {
         scroll.v = clamp(v, -5000, 5000)
         raw = nil
         if !cfg.animate { scroll.snap() }
+        lock.unlock()
+        renderer.request()
         if let c = focusedCol, c.x < best - 1 || c.x + c.w > best + W + 1,
            let i = cols.firstIndex(where: { live($0) && $0.x >= best - 1 && $0.x + $0.w <= best + W + 1 }) {
             fc = i
-            if let w = focusedWin { focus(w) }
+            // Activating an app stalls its window for a moment, so wait until the glide ends.
+            lock.lock(); focusWhenSettled = focusedWin; lock.unlock()
         }
     }
 
@@ -266,10 +274,22 @@ final class Strip {
         return r < 0 ? -rb(-r) : r > m ? m + rb(r - m) : r
     }
 
+    // Follow the fingers. Only records the target; the render queue draws it.
     func drive(_ r: Double) {
-        raw = clamp(r, -W * 0.7, maxScroll + W * 0.7)
+        let lo = -W * 0.7, hi = maxScroll + W * 0.7
+        lock.lock()
+        focusWhenSettled = nil
+        raw = clamp(r, lo, hi)
         scroll.x = rubber(raw!); scroll.t = scroll.x; scroll.v = 0
-        apply()
+        lock.unlock()
+        renderer.request()
+    }
+
+    func beginDrive() {
+        lock.lock()
+        scroll.t = scroll.x; scroll.v = 0
+        raw = scroll.x
+        lock.unlock()
     }
 }
 
@@ -287,8 +307,6 @@ func relayout(_ s: Strip, snap: Bool = false, force: Bool = false) {
     s.layout()
     s.reveal(snap: snap)
     s.apply(force: force)
-    if force && s.respectStubborn() { s.layout(); s.reveal(snap: true); s.apply() }
-    kick()
 }
 
 // MARK: - Displays
@@ -300,7 +318,7 @@ func refreshScreens() {
     for sc in NSScreen.screens {
         guard let id = sc.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { continue }
         let s = screens.first { $0.display == id } ?? Strip(display: id)
-        s.area = ax(sc.visibleFrame); s.full = ax(sc.frame)
+        lock.lock(); s.area = ax(sc.visibleFrame); s.full = ax(sc.frame); lock.unlock()
         next.append(s)
     }
     // Columns from displays that went away join the main display's strip.
@@ -309,7 +327,8 @@ func refreshScreens() {
             main.cols += old.cols + [old.pinL, old.pinR].compactMap { $0 }
         }
     }
-    screens = next
+    lock.lock(); screens = next; lock.unlock()
+    renderer.fps = Double(NSScreen.screens.map(\.maximumFramesPerSecond).max() ?? 60)
     for s in screens { for c in s.cols { c.minW = 0 }; relayout(s, snap: true, force: true) }
 }
 
@@ -354,7 +373,7 @@ func track(_ el: AXUIElement, pid: pid_t, initial: Bool = false) -> Win? {
         // Background windows don't steal focus or scroll the strip.
         let front = NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
         s.insert(w, after: front)
-        relayout(s, force: true)
+        relayout(s)
     }
     return w
 }
@@ -419,27 +438,121 @@ func focus(_ w: Win) {
     AXUIElementPerformAction(w.el, kAXRaiseAction as CFString)
 }
 
-// MARK: - Animation
+// MARK: - Rendering
 
-var timer: Timer?
-var lastTick = 0.0
+final class Renderer {
+    let q = DispatchQueue(label: "dev.chain.render", qos: .userInteractive)
+    var fps = 60.0
+    private var timer: DispatchSourceTimer?
+    private var last = 0.0
+    private var stopped = false
+    private struct Job { let win: Win, rect: CGRect, sized: Bool, raise: Bool, item: Item, strip: Strip }
+    private var jobs: [Job] = []
+    // Each app gets its own queue; a frame never waits on an app still busy with the last one.
+    private var appQueues: [pid_t: DispatchQueue] = [:]
+    private var inFlight = Set<pid_t>()
 
-func kick() {
-    guard timer == nil else { return }
-    lastTick = CACurrentMediaTime()
-    let t = Timer(timeInterval: 1.0 / 60, repeats: true) { _ in
-        let now = CACurrentMediaTime(), dt = min(0.034, now - lastTick)
-        lastTick = now
-        var busy = false
-        for s in screens where s.raw == nil {
-            if s.scroll.step(dt, 13) { busy = true }
-            s.apply()
-        }
-        if !busy { timer?.invalidate(); timer = nil }
+    // Called from the main thread after publishing new targets.
+    func request() { q.async { self.start() } }
+
+    private func start() {
+        guard timer == nil, !stopped else { return }
+        last = CACurrentMediaTime() - 1 / fps
+        let t = DispatchSource.makeTimerSource(flags: .strict, queue: q)
+        t.schedule(deadline: .now(), repeating: 1 / fps, leeway: .microseconds(250))
+        t.setEventHandler { [unowned self] in frame() }
+        t.resume()
+        timer = t
     }
-    RunLoop.main.add(t, forMode: .common)
-    timer = t
+
+    private func frame() {
+        let now = CACurrentMediaTime(), dt = clamp(now - last, 0.001, 0.034)
+        last = now
+        var busy = false
+        jobs.removeAll(keepingCapacity: true)
+
+        var settled: [Win] = []
+        lock.lock()
+        for s in screens {
+            if s.raw != nil { busy = true } else if s.scroll.step(dt, 13) { busy = true }
+            else if let w = s.focusWhenSettled { settled.append(w); s.focusWhenSettled = nil }
+            let force = s.forcePending
+            s.forcePending = false
+            let base = s.origin - s.scroll.x
+            for it in s.items {
+                let w = it.win
+                w.sx.t = it.rel.minX; w.sy.t = it.rel.minY
+                if w.fresh || !cfg.animate { w.sx.snap(); w.sy.snap(); w.fresh = false }
+                if w.sx.step(dt, 15) { busy = true }
+                if w.sy.step(dt, 15) { busy = true }
+                var r = CGRect(x: round((it.fixed ? s.area.minX : base) + w.sx.x), y: round(w.sy.x),
+                               width: it.rel.width, height: it.rel.height)
+                let visible = r.intersects(s.area)
+                // Off-screen columns must not spill onto a neighbouring display: park them in a corner.
+                if !visible, screens.contains(where: { $0 !== s && r.intersects($0.full) }) {
+                    r.origin = CGPoint(x: s.full.maxX - 1, y: s.full.maxY - 1)
+                }
+                if !force {
+                    if r == w.placed { continue }
+                    // Hidden before and after: nothing on screen changes, so skip the round trip.
+                    if !visible, !w.placed.isNull, !w.placed.intersects(s.area), r.size == w.placed.size { continue }
+                }
+                // App still applying the previous frame: try again next frame with the latest position.
+                if inFlight.contains(w.pid) { busy = true; continue }
+                jobs.append(Job(win: w, rect: r, sized: force || r.size != w.placed.size,
+                                raise: force && it.raise, item: it, strip: s))
+                w.placed = r
+            }
+        }
+        lock.unlock()
+
+        var i = 0
+        while i < jobs.count {
+            let pid = jobs[i].win.pid
+            var batch: [Job] = []
+            while i < jobs.count, jobs[i].win.pid == pid { batch.append(jobs[i]); i += 1 }
+            inFlight.insert(pid)
+            appQueue(pid).async { [unowned self, batch] in
+                for j in batch { send(j) }
+                q.async { self.inFlight.remove(pid) }
+            }
+        }
+        for w in settled { DispatchQueue.main.async { focus(w) } }
+
+        if !busy && jobs.isEmpty && inFlight.isEmpty { timer?.cancel(); timer = nil }
+    }
+
+    private func appQueue(_ pid: pid_t) -> DispatchQueue {
+        if let aq = appQueues[pid] { return aq }
+        let aq = DispatchQueue(label: "dev.chain.app", qos: .userInteractive)
+        appQueues[pid] = aq
+        return aq
+    }
+    func forget(_ pid: pid_t) { q.async { self.appQueues[pid] = nil } }
+
+    private func send(_ j: Job) {
+        let el = j.win.el
+        if j.sized { axSetSize(el, j.rect.size); axSetPos(el, j.rect.origin); axSetSize(el, j.rect.size) }
+        else { axSetPos(el, j.rect.origin) }
+        if j.raise { AXUIElementPerformAction(el, kAXRaiseAction as CFString) }
+        // Apps that refuse a width keep the width they chose.
+        if j.sized, let f = axFrame(el), f.width > j.rect.width + 2 {
+            let col = j.item.col, s = j.strip
+            DispatchQueue.main.async {
+                if f.width < s.area.width, f.width > col.minW { col.minW = f.width; relayout(s) }
+            }
+        }
+    }
+
+    // Runs `body` on the render queue with animation stopped (used for direct window moves).
+    func sync(_ body: () -> Void) { q.sync { body() } }
+    func stop() {
+        let pending = q.sync { stopped = true; timer?.cancel(); timer = nil; return Array(appQueues.values) }
+        for aq in pending { aq.sync {} }
+    }
 }
+
+let renderer = Renderer()
 
 // MARK: - Actions
 
@@ -522,12 +635,11 @@ func run(_ action: String) {
             if left { s.pinL = c } else { s.pinR = c }
             s.fc = min(s.fc, max(0, s.cols.count - 1))
         }
-        s.apply(force: true)
     case "next-display":
         guard screens.count > 1, let i = screens.firstIndex(where: { $0 === s }) else { return }
         let to = screens[(i + 1) % screens.count]
         s.detach(w); to.insert(w, frac: c.frac)
-        relayout(s, force: true); relayout(to, force: true)
+        relayout(s); relayout(to)
         focus(w)
         return
     default:
@@ -540,8 +652,8 @@ func run(_ action: String) {
 
     s.layout()
     if centre { s.centre() } else { s.reveal() }
-    s.apply(force: true)  // sizes/rows may have changed; positions settle via the spring
-    kick()
+    // Only tab switches and pinning need every frame re-sent; everything else animates.
+    s.apply(force: ["tabbed", "focus-up", "focus-down", "pin-left", "pin-right"].contains(action))
     if let nw = s.focusedWin, nw !== w || action.hasPrefix("focus") { focus(nw) }
 }
 
@@ -549,21 +661,25 @@ func toggleFloat(_ w: Win) {
     if w.floating {
         w.floating = false
         let f = axFrame(w.el) ?? .zero
-        if let s = strip(at: CGPoint(x: f.midX, y: f.midY)) ?? screens.first { s.insert(w); relayout(s, force: true) }
+        if let s = strip(at: CGPoint(x: f.midX, y: f.midY)) ?? screens.first { s.insert(w); relayout(s) }
     } else if let s = strip(for: w) {
         w.floating = true
         s.detach(w)
+        relayout(s)
         // Drop the floating window in the middle of the visible area.
-        let size = CGSize(width: min(w.placed.width, s.area.width * 0.6), height: min(w.placed.height, s.area.height * 0.7))
-        axSetSize(w.el, size)
-        axSetPos(w.el, CGPoint(x: s.area.midX - size.width / 2, y: s.area.midY - size.height / 2))
-        w.placed = .null
-        relayout(s, force: true)
+        let area = s.area
+        renderer.sync {
+            let size = CGSize(width: min(w.placed.width, area.width * 0.6), height: min(w.placed.height, area.height * 0.7))
+            axSetSize(w.el, size)
+            axSetPos(w.el, CGPoint(x: area.midX - size.width / 2, y: area.midY - size.height / 2))
+            w.placed = .null
+        }
     }
 }
 
 // Put every window back inside its display before exiting.
 func restoreAll() {
+    renderer.stop()
     for s in screens {
         var i = 0.0
         for c in s.cols + [s.pinL, s.pinR].compactMap({ $0 }) {
@@ -596,7 +712,31 @@ let keymap: [Int64: [String?]] = {
 }()
 
 var tap: CFMachPort?
-var gesture: (strip: Strip, last: Double, vel: Double)?
+
+// A two-finger drag in progress. Velocity comes from the last 100 ms of movement,
+// so a pause before lifting the fingers means no fling.
+struct Gesture {
+    let strip: Strip
+    var samples: [(t: Double, d: Double)] = []
+    var lastEvent = 0.0
+    mutating func add(_ t: Double, _ d: Double) {
+        samples.append((t, d)); lastEvent = t
+        samples.removeAll { t - $0.t > 0.1 }
+    }
+    func velocity(at now: Double) -> Double {
+        let recent = samples.filter { now - $0.t <= 0.1 }
+        guard let first = recent.first else { return 0 }
+        return recent.reduce(0) { $0 + $1.d } / max(now - first.t, 1.0 / 60)
+    }
+}
+var gesture: Gesture?
+var swallowMomentum = false           // the fling is ours; don't let it scroll the app underneath
+
+func endGesture(_ now: Double) {
+    guard let gs = gesture else { return }
+    gesture = nil
+    gs.strip.settle(velocity: gs.velocity(at: now))
+}
 
 let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -615,36 +755,45 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         }
     }
 
-    if type == .scrollWheel, chord || gesture != nil {
-        let phase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
+    if type == .scrollWheel {
         let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
-        if momentum != 0 { return gesture == nil && !chord ? Unmanaged.passUnretained(event) : nil }
+        if momentum != 0 {
+            guard swallowMomentum else { return Unmanaged.passUnretained(event) }
+            if momentum == 3 /* ended */ { swallowMomentum = false }
+            return nil
+        }
+        guard chord || gesture != nil else { return Unmanaged.passUnretained(event) }
         if event.getIntegerValueField(.scrollWheelEventIsContinuous) == 0 {
             // Mouse wheel: one notch, one column.
             let d = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
             if d != 0 { run(d > 0 ? "focus-left" : "focus-right") }
             return nil
         }
+        let phase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
         let dx = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
         let dy = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
-        let d = abs(dx) >= abs(dy) ? dx : dy
+        let d = -(abs(dx) >= abs(dy) ? dx : dy)
         let now = CACurrentMediaTime()
-        if gesture == nil, let s = strip(at: event.location) ?? screens.first {
-            gesture = (s, now, 0); timer?.invalidate(); timer = nil
-            s.raw = s.scroll.x
+        if gesture == nil {
+            guard let s = strip(at: event.location) ?? screens.first else { return nil }
+            gesture = Gesture(strip: s)
+            swallowMomentum = false
+            s.beginDrive()
         }
-        guard var gs = gesture else { return nil }
-        let s = gs.strip
+        let s = gesture!.strip
         if d != 0 {
-            s.drive((s.raw ?? s.scroll.x) - d)
-            let dt = max(0.004, now - gs.last)
-            gs.vel = 0.6 * gs.vel + 0.4 * (-d / dt); gs.last = now
-            gesture = gs
+            gesture!.add(now, d)
+            lock.lock(); let raw = s.raw ?? s.scroll.x; lock.unlock()
+            s.drive(raw + d)
         }
         if phase == 4 /* ended */ || phase == 8 /* cancelled */ {
-            s.settle(velocity: gs.vel)
-            gesture = nil
-            kick()
+            endGesture(now)
+            swallowMomentum = true
+        } else if phase == 0 {
+            // Devices that never report an end phase: settle after a short pause.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                if let gs = gesture, gs.strip === s, CACurrentMediaTime() - gs.lastEvent >= 0.14 { endGesture(CACurrentMediaTime()) }
+            }
         }
         return nil
     }
@@ -694,6 +843,7 @@ ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object:
     guard let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
     let pid = a.processIdentifier
     observers[pid] = nil
+    renderer.forget(pid)
     for w in wins.values where w.pid == pid { untrack(w) }
 }
 ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
